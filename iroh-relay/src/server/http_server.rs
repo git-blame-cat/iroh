@@ -24,8 +24,9 @@ use hyper::{
 use n0_error::{e, ensure, stack_error};
 use n0_future::MaybeFuture;
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::{Notify, watch},
+    time::Instant,
 };
 use tokio_rustls_acme::AcmeAcceptor;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
@@ -37,9 +38,11 @@ use super::{
 };
 use crate::{
     KeyCache,
-    defaults::{DEFAULT_KEY_CACHE_CAPACITY, timeouts::SERVER_WRITE_TIMEOUT},
+    defaults::{
+        DEFAULT_KEY_CACHE_CAPACITY, DEFAULT_LISTEN_BACKLOG, timeouts::SERVER_WRITE_TIMEOUT,
+    },
     http::{
-        CLIENT_AUTH_HEADER, ProtocolVersion, RELAY_PATH, SUPPORTED_WEBSOCKET_VERSION,
+        CLIENT_AUTH_HEADER, ProtocolVersion, RELAY_RELATIVE_PATH, SUPPORTED_WEBSOCKET_VERSION,
         WEBSOCKET_UPGRADE_PROTOCOL,
     },
     protos::{handshake, relay::MAX_FRAME_SIZE, streams::WsBytesFramed},
@@ -350,10 +353,24 @@ pub(super) struct ServerBuilder {
     client_rx_ratelimit: Option<ClientRateLimit>,
     /// The capacity of the key cache.
     key_cache_capacity: usize,
+    /// Listen queue length.
+    listen_backlog: u32,
     /// Access control for endpoints.
     access: Arc<dyn DynAccessControl>,
     metrics: Option<Arc<Metrics>>,
     establish_timeout: Duration,
+}
+
+/// Bind a TCP listener on `addr` with a listen queue of `backlog`.
+fn bind_listener(addr: SocketAddr, backlog: u32) -> std::io::Result<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog)
 }
 
 impl ServerBuilder {
@@ -366,6 +383,7 @@ impl ServerBuilder {
             headers: HeaderMap::new(),
             client_rx_ratelimit: None,
             key_cache_capacity: DEFAULT_KEY_CACHE_CAPACITY,
+            listen_backlog: DEFAULT_LISTEN_BACKLOG,
             access: Arc::new(AllowAll),
             metrics: None,
             establish_timeout: ESTABLISH_TIMEOUT,
@@ -438,8 +456,14 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the listen queue length.
+    pub(super) fn listen_backlog(mut self, backlog: u32) -> Self {
+        self.listen_backlog = backlog;
+        self
+    }
+
     /// Builds and spawns an HTTP(S) Relay Server.
-    pub(super) async fn spawn(self) -> Result<Server, SpawnError> {
+    pub(super) fn spawn(self) -> Result<Server, SpawnError> {
         let cancel_token = CancellationToken::new();
 
         let service = RelayService::new(
@@ -456,8 +480,7 @@ impl ServerBuilder {
 
         // Bind a TCP listener on `addr` and handles content using HTTPS.
 
-        let listener = TcpListener::bind(&addr)
-            .await
+        let listener = bind_listener(addr, self.listen_backlog)
             .map_err(|err| e!(super::SpawnError::BindTcpListener { addr }, err))?;
 
         let addr = listener
@@ -498,9 +521,10 @@ impl ServerBuilder {
                                         .await
                                 }.instrument(info_span!("conn", peer = %peer_addr)));
                             }
-                            Err(err) => {
-                                error!("failed to accept connection: {err}");
-                            }
+                            Err(err) => tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = handle_accept_error(err) => continue,
+                            },
                         }
                     }
                 }
@@ -517,6 +541,28 @@ impl ServerBuilder {
             cancel_server_loop: cancel_token,
             service,
         })
+    }
+}
+
+/// Waits after a failed `accept()` before the listener tries again.
+///
+/// Dropping the future cancels the back off.
+pub(super) async fn handle_accept_error(err: std::io::Error) {
+    use std::io::ErrorKind;
+
+    match err.kind() {
+        // Ignore common transient connection errors
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::TimedOut
+        | ErrorKind::Interrupted => {}
+        // Other errors can persist until resources are freed, so
+        // retrying immediately would busy-loop
+        _ => {
+            error!("failed to accept connection: {err}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
 
@@ -630,7 +676,8 @@ impl RelayServiceWithNotify {
         // waiting for it to complete to then return a response.
         tokio::task::spawn({
             let this = self.clone();
-            async move {
+            let deadline = Instant::now() + this.establish_timeout;
+            let establish = async move {
                 match hyper::upgrade::on(&mut req).await {
                     Ok(upgraded) => {
                         let (parts, _) = req.into_parts();
@@ -650,6 +697,13 @@ impl RelayServiceWithNotify {
                         };
                     }
                     Err(err) => warn!("upgrade error: {err:#}"),
+                }
+            };
+            async move {
+                // After the WebSocket upgrade, the HTTP timeout no longer covers this socket.
+                // Give the client a deadline to finish authentication and the access check.
+                if tokio::time::timeout_at(deadline, establish).await.is_err() {
+                    debug!("relay connection establishment timed out");
                 }
             }
             .instrument(info_span!("handler"))
@@ -684,7 +738,7 @@ impl RelayServiceWithNotify {
 /// ## Example
 ///
 /// ```no_run
-/// # use std::sync::Arc;
+/// # use std::{sync::Arc, time::Duration};
 /// # use http::HeaderMap;
 /// # use hyper::server::conn::http1;
 /// # use hyper_util::rt::TokioIo;
@@ -706,7 +760,11 @@ impl RelayServiceWithNotify {
 ///     Arc::new(AllowAll),
 ///     Arc::new(Metrics::default()),
 /// );
-/// let service = RelayServiceWithNotify::new(service, Arc::new(Notify::new()));
+/// let service = RelayServiceWithNotify::with_timeout(
+///     service,
+///     Arc::new(Notify::new()),
+///     Duration::from_secs(30),
+/// );
 ///
 /// let listener = TcpListener::bind("127.0.0.1:0").await?;
 /// let (stream, _peer) = listener.accept().await?;
@@ -724,6 +782,7 @@ impl RelayServiceWithNotify {
 pub struct RelayServiceWithNotify {
     service: RelayService,
     on_establish: Arc<Notify>,
+    establish_timeout: Duration,
 }
 
 impl RelayServiceWithNotify {
@@ -731,10 +790,29 @@ impl RelayServiceWithNotify {
     ///
     /// The `on_establish` notification is triggered once the connection is passed to the
     /// relay protocol, i.e. after a WebSocket request on /relay is received and established.
+    /// Upgraded connections must finish authentication and authorization within 30 seconds
+    /// of receiving the upgrade request.
     pub fn new(service: RelayService, on_establish: Arc<Notify>) -> Self {
+        Self::with_timeout(service, on_establish, ESTABLISH_TIMEOUT)
+    }
+
+    /// Creates a service wrapper with a relay establishment timeout.
+    ///
+    /// Each upgrade request starts a new timeout covering the WebSocket upgrade, authentication,
+    /// and authorization. The `on_establish` notification is triggered once the connection is
+    /// passed to the relay protocol. Established connections are not subject to this timeout.
+    ///
+    /// The caller must separately bound TLS handshakes and HTTP requests before an upgrade request
+    /// reaches this service.
+    pub fn with_timeout(
+        service: RelayService,
+        on_establish: Arc<Notify>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             service,
             on_establish,
+            establish_timeout: timeout,
         }
     }
 }
@@ -746,10 +824,9 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         // Create a client if the request hits the relay endpoint.
-        if matches!(
-            (req.method(), req.uri().path()),
-            (&hyper::Method::GET, RELAY_PATH)
-        ) {
+        if req.method() == hyper::Method::GET
+            && req.uri().path().strip_prefix('/') == Some(RELAY_RELATIVE_PATH)
+        {
             let response = match self.handle_relay_ws_upgrade(req) {
                 Ok(response) => Ok(response),
                 // It's convention to send back the version(s) we *do* support
@@ -863,7 +940,7 @@ impl Inner {
             // Serve will create a WebSocketStream on an already upgraded connection
             .serve(io);
 
-        let mut io = WsBytesFramed { io: websocket };
+        let mut io = WsBytesFramed::new(websocket);
 
         let client_auth_header = request_parts.headers.get(CLIENT_AUTH_HEADER).cloned();
         let authentication = handshake::serverside(&mut io, client_auth_header).await?;
@@ -958,8 +1035,9 @@ impl RelayService {
     ///
     /// If a `tls_config` is given, will serve the connection using HTTPS, otherwise HTTP.
     ///
-    /// If the connection did not fully upgrade to a relay WebSocket connection after
-    /// `establish_timeout`, the connection is aborted.
+    /// TLS and HTTP establishment are bounded by `establish_timeout`. An upgrade request starts
+    /// a separate timeout of the same duration for the WebSocket upgrade, authentication, and
+    /// authorization. The connection is aborted if either timeout expires.
     ///
     /// # Example
     ///
@@ -1023,7 +1101,8 @@ impl RelayService {
         // We create a notification token to be triggered once the connection is fully established
         // and passed to the relay server.
         let on_establish = Arc::new(Notify::new());
-        let service = RelayServiceWithNotify::new(self, on_establish.clone());
+        let service =
+            RelayServiceWithNotify::with_timeout(self, on_establish.clone(), establish_timeout);
 
         // This is the main connection future, driving the connection to completion.
         let serve_fut = async move {
@@ -1040,10 +1119,8 @@ impl RelayService {
             }
         };
 
-        // We set a timeout for the connection to limit lingering connections during establishment.
-        // The timeout is cleared once the connection has completed the TLS and WebSocket
-        // handshakes and has been passed over to the relay protocol handler.
-        // If the timeout expires before that happens, the connection is aborted.
+        // Bound TLS and HTTP establishment. Hyper completes this future when it hands off an
+        // upgraded socket; the upgrade task separately bounds authentication and authorization.
         let res = clearable_timeout(establish_timeout, on_establish, serve_fut)
             .await
             .map_err(|_elapsed| e!(ServeConnectionError::EstablishTimeout))
@@ -1229,6 +1306,35 @@ mod tests {
         TlsConfig::new(Arc::new(config))
     }
 
+    /// Linux completes at most `backlog + 1` handshakes that are not yet accepted,
+    /// then drops further SYNs, so a sequential connect beyond that times out.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[traced_test]
+    async fn test_listen_backlog() -> Result {
+        const BACKLOG: u32 = 4;
+        const MAX_CLIENTS: usize = 64;
+
+        let listener =
+            bind_listener((std::net::Ipv4Addr::LOCALHOST, 0).into(), BACKLOG).anyerr()?;
+        let addr = listener.local_addr().anyerr()?;
+
+        let mut streams = Vec::new();
+        while streams.len() < MAX_CLIENTS {
+            let connect = TcpStream::connect(addr);
+            match tokio::time::timeout(Duration::from_millis(250), connect).await {
+                Ok(stream) => streams.push(stream.anyerr()?),
+                Err(_elapsed) => break,
+            }
+        }
+        assert!(
+            (BACKLOG..=BACKLOG + 1).contains(&(streams.len() as u32)),
+            "accept queue held {} connections for backlog {BACKLOG}",
+            streams.len()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn test_http_clients_and_server() -> Result {
@@ -1238,9 +1344,7 @@ mod tests {
         let b_key = SecretKey::from_bytes(&rng.random());
 
         // start server
-        let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
-            .spawn()
-            .await?;
+        let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap()).spawn()?;
 
         let addr = server.addr();
 
@@ -1352,9 +1456,7 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn test_subprotocol_negotiation_picks_latest() -> Result {
-        let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
-            .spawn()
-            .await?;
+        let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap()).spawn()?;
         let addr = server.addr();
 
         for offered in [
@@ -1363,7 +1465,7 @@ mod tests {
             "baz, iroh-relay-v1, iroh-relay-v2, boo",
             "foo, iroh-relay-v2, bar",
         ] {
-            let ws_uri = format!("ws://{addr}{RELAY_PATH}");
+            let ws_uri = format!("ws://{addr}/{RELAY_RELATIVE_PATH}");
             let (_stream, response) = tokio_websockets::ClientBuilder::new()
                 .uri(&ws_uri)
                 .expect("valid websocket URI")
@@ -1400,8 +1502,7 @@ mod tests {
         // start server
         let mut server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
             .tls_config(Some(tls_config))
-            .spawn()
-            .await?;
+            .spawn()?;
 
         let addr = server.addr();
 
@@ -1760,8 +1861,7 @@ mod tests {
         // Start server with a very short establish timeout.
         let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
             .establish_timeout(Duration::from_millis(500))
-            .spawn()
-            .await?;
+            .spawn()?;
 
         let addr = server.addr();
         let port = addr.port();

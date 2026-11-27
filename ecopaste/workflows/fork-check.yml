@@ -2,9 +2,9 @@ name: Fork Check
 
 on:
   push:
-    branches: [ecopaste]
+    branches: [main]
   pull_request:
-    branches: [ecopaste]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
